@@ -1,0 +1,72 @@
+# CI exists to prove the recipe is reproducible by someone who is not us -- a
+# clean machine, nothing cached, only PINNED and configure-flags.sh. It is the
+# public half of the GPL corresponding-source claim: if this workflow is green,
+# the instructions in this repo really do produce these binaries.
+#
+# What CI deliberately does NOT do:
+#   * sign. Azure Artifact Signing authenticates on the machine it runs on and
+#     needs an interactive `az login`; release binaries are built and signed on
+#     the maintainer's Windows box via build-win64.sh --sign. Nothing here has,
+#     or should have, a signing credential.
+#   * claim the nvenc paths work. GitHub runners have no NVIDIA GPU, so
+#     verify.py reports those call sites as HWSKIP: the encoder is proven
+#     present in the binary, but no device could be opened. It never silently
+#     downgrades a missing encoder to a skip.
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git nasm pkg-config \
+                                  autoconf automake libtool python3
+      - name: Build
+        run: ./build-linux.sh
+      - name: Show what was built
+        run: |
+          ./dist/linux-x86_64/ffmpeg -hide_banner -version | head -1
+          ls -l dist/linux-x86_64
+          cat dist/linux-x86_64/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drokk-ffmpeg-linux-x86_64
+          path: dist/linux-x86_64/
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      # Same environment the maintainer's box uses (build-win64.sh --setup
+      # installs this exact set via pacman), just provisioned by the action.
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: make pkg-config git autoconf automake libtool diffutils python
+          pacboy: toolchain:p nasm:p
+      - name: Build
+        run: ./remote-build.sh
+      - name: Verify
+        run: python verify.py build/ffmpeg/ffmpeg.exe --outdir verify-out
+      - name: Stage artifact
+        run: |
+          mkdir -p dist/win64
+          cp build/ffmpeg/ffmpeg.exe dist/win64/ffmpeg.exe
+          (cd dist/win64 && sha256sum ffmpeg.exe > SHA256SUMS && cat SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drokk-ffmpeg-win64-unsigned
+          path: dist/win64/
