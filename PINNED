@@ -1,0 +1,59 @@
+# drokk-ffmpeg — pinned upstream sources.
+#
+# This file is the single source of truth for what goes into a drokk-ffmpeg
+# binary. Together with configure-flags.sh and the two build scripts it is the
+# complete recipe: that is what discharges the GPL "corresponding source"
+# obligation for the ffmpeg.exe / ffmpeg the DrokkPuppet mods ship.
+#
+# Format: KEY=VALUE, '#' comments. Both the tag AND the peeled commit are
+# recorded. The build scripts clone --depth 1 --branch <tag> and then assert
+# `git rev-parse HEAD` equals the commit; a tag that moves is caught, not
+# silently accepted.
+#
+# Verified with `git ls-remote` on 2026-09-03.
+
+# --- ffmpeg -----------------------------------------------------------------
+# Newest stable release tag of the n8.1 series (n8.1, n8.1.1, n8.1.2 exist; no
+# n8.2). Matches the ffmpeg Fedora 44 ships, which is a useful sanity check.
+# NOTE: this is the PEELED commit (`n8.1.2^{}`), i.e. what a --branch clone
+# leaves at HEAD -- NOT the annotated tag object (1c2c67c0...).
+FFMPEG_REPO=https://github.com/FFmpeg/FFmpeg.git
+FFMPEG_TAG=n8.1.2
+FFMPEG_COMMIT=38b88335f99e76ed89ff3c93f877fdefce736c13
+
+# --- x264 -------------------------------------------------------------------
+# x264 publishes NO tags at all (`git ls-remote --tags` returns nothing), so a
+# raw commit off a named branch is the only possible pin. We track `stable`,
+# which is the branch distributions track.
+X264_REPO=https://code.videolan.org/videolan/x264.git
+X264_BRANCH=stable
+X264_COMMIT=b35605ace3ddf7c1a5d67a2eb553f034aef41d55
+# For reference, master as of the same ls-remote:
+#   0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee
+
+# --- nv-codec-headers (ffnvcodec) -------------------------------------------
+# Header-only. Enables h264_nvenc, which 7 Days to Die's video path REQUIRES
+# (it hardcodes -c:v h264_nvenc with no libx264 fallback).
+#
+# PIN THE OLDEST VERSION FFMPEG ACCEPTS, NOT THE NEWEST THAT EXISTS. These
+# headers declare an NVENC API version and the driver refuses anything newer
+# than it implements. Built against n13.1.15.0 (the newest tag), h264_nvenc
+# died at runtime on an RTX 3090 with:
+#     Driver does not support the required nvenc API version.
+#     Required: 13.1 Found: 13.0
+#     The minimum required Nvidia driver for nvenc is 610.00 or newer
+# -- i.e. the newest headers silently raise the driver floor for every player.
+# ffmpeg n8.1.2's configure floor is `ffnvcodec >= 12.1.14.0` (configure:7126),
+# so n12.1.14.1 is the most compatible pin that still configures: NVENC SDK
+# 12.1, driver >= 531.61 (Windows) / 530.41 (Linux), March 2023.
+NVCODEC_REPO=https://github.com/FFmpeg/nv-codec-headers.git
+NVCODEC_TAG=n12.1.14.1
+NVCODEC_COMMIT=7c8e7fc751f803c672b42c37d9199c8a4f98b327
+
+# --- opus -------------------------------------------------------------------
+# BSD-3-Clause. Used by the Lethal Company and 7 Days audio pipes
+# (-c:a libopus). Built from source rather than taken from the distro so the
+# Windows and Linux binaries have identical composition.
+OPUS_REPO=https://github.com/xiph/opus.git
+OPUS_TAG=v1.5.2
+OPUS_COMMIT=ddbe48383984d56acd9e1ab6a090c54ca6b735a6

@@ -1,0 +1,9 @@
+# Built artifacts. dist/ is what a release uploads; it is never committed --
+# the repo is the *recipe* (PINNED + configure-flags.sh + the build scripts),
+# which is what the GPL corresponding-source offer points at.
+/dist/
+# Upstream source clones and object trees, several GB.
+/build/
+*.log
+build-linux.out
+verify-out/
