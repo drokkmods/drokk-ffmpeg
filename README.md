@@ -149,6 +149,19 @@ It distinguishes **"not compiled in"** (a build defect, fails the build) from
 never conflated, because an `h264_nvenc` that is absent and an `h264_nvenc`
 that cannot open a device look similar in a log and mean opposite things.
 
+### One thing verification found that is not a build problem
+
+Lethal Company's nvenc probe renders **64x64**, and NVENC rejects it:
+*"Frame Dimension less than the minimum supported value."* That is a hardware
+limit, not a missing feature — H.264 NVENC's minimum width is 145 — and it was
+reproduced on two different GPUs (RTX 3090, RTX 4080) with both this build and
+a stock distribution ffmpeg. So the probe as written reports "nvenc unusable"
+on every NVIDIA card, and Lethal Company always takes the libx264 branch.
+
+`verify.py` reports that call site as `HWSKIP` rather than `FAIL`, because the
+encoder is provably in the binary — the identical 320x240 encode next to it
+passes. Fixing the probe's resolution belongs to the mod, not here.
+
 ## How mods should locate this binary
 
 Do **not** hard-pin the bundled binary. Resolution order, in every mod:
