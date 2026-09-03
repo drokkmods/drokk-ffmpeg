@@ -53,4 +53,16 @@ done
 
 # One invocation, all files: one SSH round trip, one Azure auth, one dlib start.
 # Re-signing an already-signed file is safe -- signtool replaces the signature.
-exec "$SIGN_REMOTE" "${FILES[@]}"
+"$SIGN_REMOTE" "${FILES[@]}" || die "signing failed"
+
+# Signing REWRITES the binary -- it appends a PE certificate table, so the file
+# grows and its hash changes. build-win64.sh wrote SHA256SUMS from the unsigned
+# artifact, which is now wrong. Refresh it here rather than in the build script,
+# because signing is the last step that mutates the file and the release tooling
+# (SHARE_PARTS.md 4.2) verifies staged binaries against exactly these sums.
+for f in "${FILES[@]}"; do
+  d="$(dirname "$f")"
+  ( cd "$d" && sha256sum "$(basename "$f")" > SHA256SUMS ) \
+    || die "could not refresh SHA256SUMS in $d"
+  echo "==> SHA256SUMS refreshed: $(cut -d' ' -f1 "$d/SHA256SUMS")  $(basename "$f")"
+done
