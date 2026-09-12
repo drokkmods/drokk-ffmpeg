@@ -30,7 +30,10 @@ gcc -dumpmachine | grep -q mingw || die "gcc is not a mingw compiler: $(gcc -dum
 
 set -a; . <(grep -E '^[A-Z0-9_]+=' "$HERE/PINNED"); set +a
 . "$HERE/configure-flags.sh"
-mapfile -t FLAGS < <(drokk_ffmpeg_flags_clean)
+# win64 explicitly: this script only ever runs under MSYSTEM=MINGW64 (asserted
+# above), and the pulse/alsa flags configure-flags.sh adds for linux would kill
+# ./configure here. See its PLATFORM ARGUMENT note.
+mapfile -t FLAGS < <(drokk_ffmpeg_flags_clean win64)
 
 mkdir -p "$WORK" "$PREFIX"
 

@@ -52,7 +52,10 @@ done
 # shellcheck disable=SC1090
 set -a; . <(grep -E '^[A-Z0-9_]+=' "$HERE/PINNED"); set +a
 . "$HERE/configure-flags.sh"
-mapfile -t FLAGS < <(drokk_ffmpeg_flags_clean)
+# "linux" is not the default-by-uname: it is the whole point of this script, and
+# an unqualified call here would silently build a win64 flag set if the function's
+# platform guess ever changed. See configure-flags.sh's PLATFORM ARGUMENT note.
+mapfile -t FLAGS < <(drokk_ffmpeg_flags_clean linux)
 
 if [ "$ONLY_VERIFY" = "1" ]; then
   [ -x "$DIST/ffmpeg" ] || die "no binary at $DIST/ffmpeg"
@@ -68,6 +71,16 @@ for t in git make gcc pkg-config nasm python3 autoconf automake libtool; do
 done
 # x264's asm needs nasm >= 2.13; the distro yasm 1.3 is NOT a substitute.
 say "nasm: $(nasm -v | head -1)"
+# --enable-libpulse/--enable-alsa (configure-flags.sh's linux block) are FATAL
+# to ./configure when the dev packages are missing -- require_pkg_config and
+# "alsa requested but not found" both die -- so catch it here rather than
+# fifteen minutes into x264.
+for pc in libpulse alsa; do
+  pkg-config --exists "$pc" || die "missing dev package for pkg-config module: $pc
+  The native-Linux audio devices (AUDIO_PLAN.md section 6) need both.
+  On Fedora/Nobara:  sudo dnf install pulseaudio-libs-devel alsa-lib-devel"
+done
+say "libpulse: $(pkg-config --modversion libpulse)   alsa: $(pkg-config --modversion alsa)"
 
 [ "$CLEAN" = "1" ] && { warn "--clean: removing $WORK"; rm -rf "$WORK"; }
 mkdir -p "$WORK" "$PREFIX" "$DIST"
