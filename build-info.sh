@@ -40,6 +40,21 @@ drokk_ffmpeg_recipe_hash() {
   } | sha256sum | cut -d' ' -f1
 }
 
+# drokk_ffmpeg_require_built_from <hash-recorded-at-compile> <current-recipe-hash>
+# The build scripts reuse an already-compiled ffmpeg unless --clean. Each writes
+# the recipe hash beside the binary when it actually compiles
+# (build/.../ffmpeg/drokk-recipe-hash); this refuses to land or stamp a binary
+# whose recorded hash is missing or differs, so BUILD-INFO never claims a recipe
+# that did not produce the bytes.
+drokk_ffmpeg_require_built_from() {
+  [ -n "$1" ] && [ "$1" = "$2" ] && return 0
+  echo "==> ERROR: the compiled ffmpeg was not built from the current recipe
+  compiled from: ${1:-unknown (no drokk-recipe-hash beside the binary)}
+  recipe now:    $2
+  Refusing to land or stamp it. Rerun with --clean." >&2
+  return 1
+}
+
 # drokk_ffmpeg_write_build_info <repo> <dist-dir> <flavour> <binary-name>
 # Needs FFMPEG_TAG / FFMPEG_COMMIT from PINNED already in the environment.
 drokk_ffmpeg_write_build_info() {

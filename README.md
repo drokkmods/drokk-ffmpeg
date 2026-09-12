@@ -108,11 +108,23 @@ system-wide and the artifacts land only in `dist/`.
 Linux prerequisites (Fedora/Nobara names):
 
 ```sh
-sudo dnf install git make gcc pkgconf-pkg-config nasm autoconf automake libtool
+sudo dnf install git make gcc pkgconf-pkg-config nasm autoconf automake libtool \
+                 pulseaudio-libs-devel alsa-lib-devel
 ```
 
 `nasm` is required and `yasm` is not a substitute — x264's assembly needs
 nasm ≥ 2.13.
+
+**The Linux binary needs `libpulse.so.0` and `libasound.so.2` at runtime.**
+They back the pulse/alsa audio devices (drokkenemies `AUDIO_PLAN.md` §6) and
+neither ships a static library on Fedora, so they are the only shared
+dependencies besides glibc. Every desktop Linux has both. `build-linux.sh`
+checks the binary's direct `NEEDED` entries and refuses anything else. The
+Windows `.exe` is unaffected and stays one self-contained file.
+
+Builds reuse an already-compiled ffmpeg unless `--clean`. If the recipe changed
+since that compile, the script refuses to land or stamp it and tells you to
+rerun with `--clean`.
 
 The Windows build runs **on** a Windows machine over SSH, inside the MSYS2
 MINGW64 shell (ffmpeg and x264 are autoconf projects and need a POSIX shell).

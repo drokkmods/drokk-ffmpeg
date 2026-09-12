@@ -132,6 +132,8 @@ if [ "$CLEAN" = "1" ]; then
   psh "if (Test-Path '$FF_WIN') { Remove-Item -Recurse -Force '$FF_WIN' }" >/dev/null
 fi
 psh "New-Item -ItemType Directory -Force -Path '$FF_WIN' | Out-Null" >/dev/null
+. "$HERE/build-info.sh"
+RECIPE_HASH="$(drokk_ffmpeg_recipe_hash "$HERE")"
 
 for f in PINNED configure-flags.sh remote-build.sh verify.py; do
   scp -q -o BatchMode=yes "$HERE/$f" "$REMOTE:$FF_POSIX/$f" || die "scp failed: $f"
@@ -144,7 +146,7 @@ ok "recipe staged (PINNED, configure-flags.sh, remote-build.sh, verify.py)"
 if [ "$ONLY_VERIFY" = "0" ]; then
   LOG="$(mktemp -p "${TMPDIR:-/tmp}" drokk-ffmpeg-win64.XXXXXX.log)"
   say "building on $REMOTE (log: $LOG)"
-  msys "cd $FF_MSYS && chmod +x remote-build.sh && ./remote-build.sh" 2>&1 | tee "$LOG"
+  msys "cd $FF_MSYS && chmod +x remote-build.sh && DROKK_RECIPE_HASH=$RECIPE_HASH ./remote-build.sh" 2>&1 | tee "$LOG"
   if [ "${PIPESTATUS[0]}" -ne 0 ]; then
     grep -iE "error|fatal" "$LOG" | tail -30
     die "remote build failed -- full log: $LOG
@@ -152,6 +154,9 @@ if [ "$ONLY_VERIFY" = "0" ]; then
   fi
   ok "remote build finished"
 fi
+# remote-build.sh reuses an existing ffmpeg.exe; only land one compiled from this recipe.
+BUILT_FROM="$(msys "cat $FF_MSYS/build/ffmpeg/drokk-recipe-hash 2>/dev/null" | tr -d '\r' | tail -1)"
+drokk_ffmpeg_require_built_from "$BUILT_FROM" "$RECIPE_HASH" || exit 1
 
 # ---------------------------------------------------------------------------
 # Verify ON the box, where the exe will actually run (and where the NVIDIA
@@ -182,5 +187,5 @@ if [ "$SIGN" = "1" ]; then
 else
   say "unsigned build (pass --sign for a release build)"
 fi
-. "$HERE/build-info.sh"; drokk_ffmpeg_write_build_info "$HERE" "$DIST" win64 ffmpeg.exe || die "could not write $DIST/BUILD-INFO"
+drokk_ffmpeg_write_build_info "$HERE" "$DIST" win64 ffmpeg.exe || die "could not write $DIST/BUILD-INFO"
 ok "win64 build complete: $EXE_DEST"

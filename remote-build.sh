@@ -104,6 +104,9 @@ if [ ! -x "$WORK/ffmpeg/ffmpeg.exe" ]; then
     && make -j"$JOBS" ) > "$WORK/ffmpeg.log" 2>&1 \
     || { grep -iE "error|fatal|not found|no such" "$WORK/ffmpeg.log" | tail -30
          die "ffmpeg failed -- full log: $WORK/ffmpeg.log"; }
+  # build-win64.sh passes the recipe hash in and refuses to land an exe whose
+  # recorded hash differs (see build-info.sh). Empty if run by hand: refused.
+  echo "${DROKK_RECIPE_HASH:-}" > "$WORK/ffmpeg/drokk-recipe-hash"
 fi
 [ -x "$WORK/ffmpeg/ffmpeg.exe" ] || die "no ffmpeg.exe produced"
 strip "$WORK/ffmpeg/ffmpeg.exe" || echo "==> WARN: strip failed"

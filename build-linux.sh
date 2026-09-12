@@ -56,6 +56,8 @@ set -a; . <(grep -E '^[A-Z0-9_]+=' "$HERE/PINNED"); set +a
 # an unqualified call here would silently build a win64 flag set if the function's
 # platform guess ever changed. See configure-flags.sh's PLATFORM ARGUMENT note.
 mapfile -t FLAGS < <(drokk_ffmpeg_flags_clean linux)
+. "$HERE/build-info.sh"
+RECIPE_HASH="$(drokk_ffmpeg_recipe_hash "$HERE")"
 
 if [ "$ONLY_VERIFY" = "1" ]; then
   [ -x "$DIST/ffmpeg" ] || die "no binary at $DIST/ffmpeg"
@@ -65,7 +67,7 @@ fi
 # ---------------------------------------------------------------------------
 # Preflight: fail before a 20-minute build, not during it
 # ---------------------------------------------------------------------------
-for t in git make gcc pkg-config nasm python3 autoconf automake libtool; do
+for t in git make gcc pkg-config nasm python3 autoconf automake libtool readelf; do
   command -v "$t" >/dev/null 2>&1 || die "missing build tool: $t
   On Fedora/Nobara:  sudo dnf install git make gcc pkgconf-pkg-config nasm autoconf automake libtool"
 done
@@ -161,8 +163,10 @@ if [ ! -x "$WORK/ffmpeg/ffmpeg" ]; then
     && make -j"$JOBS" ) > "$WORK/ffmpeg.log" 2>&1 \
     || { grep -iE "error|fatal|not found|no such" "$WORK/ffmpeg.log" | tail -30
          die "ffmpeg build failed -- full log: $WORK/ffmpeg.log"; }
+  echo "$RECIPE_HASH" > "$WORK/ffmpeg/drokk-recipe-hash"
   ok "ffmpeg built"
 else ok "ffmpeg already built"; fi
+drokk_ffmpeg_require_built_from "$(cat "$WORK/ffmpeg/drokk-recipe-hash" 2>/dev/null)" "$RECIPE_HASH" || exit 1
 
 # ---------------------------------------------------------------------------
 # 5. Land it in dist/ and verify by RUNNING it
@@ -171,15 +175,21 @@ install -m 0755 "$WORK/ffmpeg/ffmpeg" "$DIST/ffmpeg"
 strip "$DIST/ffmpeg" 2>/dev/null || warn "strip failed (binary still valid, just larger)"
 say "size: $(stat -c%s "$DIST/ffmpeg") bytes ($(du -h "$DIST/ffmpeg" | cut -f1))"
 file "$DIST/ffmpeg" | sed 's/^/    /'
-# Self-contained means self-contained: nothing from $PREFIX may be a shared dep.
-if ldd "$DIST/ffmpeg" 2>/dev/null | grep -qiE "x264|opus|avcodec|avformat"; then
-  die "binary links a shared libav*/x264/opus -- the static build did not take:
-$(ldd "$DIST/ffmpeg")"
-fi
+# Self-contained, with exactly two exceptions: libpulse and libasound, the
+# native-Linux audio devices (AUDIO_PLAN.md section 6), which have no static
+# library on Fedora and are on every desktop Linux. Checked on the DIRECT NEEDED
+# entries, not ldd: ldd walks transitive deps, and libpulse's own chain pulls a
+# system libopus.so that is not ours. Anything else -- libav*, x264, opus -- fails.
+ALLOWED_NEEDED='^(libc|libm|libpthread|libdl|librt|libmvec|libgcc_s)\.so\.[0-9]+$|^ld-linux-x86-64\.so\.2$|^libpulse\.so\.0$|^libasound\.so\.2$'
+NEEDED="$(readelf -d "$DIST/ffmpeg" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')"
+[ -n "$NEEDED" ] || die "readelf found no NEEDED entries in $DIST/ffmpeg -- cannot check linkage"
+BAD="$(grep -vE "$ALLOWED_NEEDED" <<<"$NEEDED")" && die "binary has shared deps outside the allowlist (the static build did not take):
+$BAD"
+say "shared deps: $(tr '\n' ' ' <<<"$NEEDED")"
 ( cd "$DIST" && sha256sum ffmpeg > SHA256SUMS )
 ok "sha256: $(cut -d' ' -f1 "$DIST/SHA256SUMS")"
 
 say "verifying by running every real call site"
 python3 "$HERE/verify.py" "$DIST/ffmpeg" --outdir "$WORK/verify-out" || die "verification FAILED"
-. "$HERE/build-info.sh"; drokk_ffmpeg_write_build_info "$HERE" "$DIST" linux-x86_64 ffmpeg || die "could not write $DIST/BUILD-INFO"
+drokk_ffmpeg_write_build_info "$HERE" "$DIST" linux-x86_64 ffmpeg || die "could not write $DIST/BUILD-INFO"
 ok "linux build complete: $DIST/ffmpeg"
