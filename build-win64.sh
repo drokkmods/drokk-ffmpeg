@@ -182,4 +182,5 @@ if [ "$SIGN" = "1" ]; then
 else
   say "unsigned build (pass --sign for a release build)"
 fi
+. "$HERE/build-info.sh"; drokk_ffmpeg_write_build_info "$HERE" "$DIST" win64 ffmpeg.exe || die "could not write $DIST/BUILD-INFO"
 ok "win64 build complete: $EXE_DEST"

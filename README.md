@@ -196,7 +196,7 @@ remote-build.sh      the Windows half, as it runs inside the MSYS2 MINGW64 shell
 sign-win64.sh        Authenticode signing (delegates to the mod repo's sign_remote.sh)
 verify.py            runs the binary against all seven real call sites
 licenses/            GPLv2, LGPLv2.1, x264, Opus, nv-codec-headers
-dist/                gitignored: built artifacts + SHA256SUMS
+dist/                gitignored: built artifacts + SHA256SUMS + BUILD-INFO (see build-info.sh)
 ```
 
 ## Attribution

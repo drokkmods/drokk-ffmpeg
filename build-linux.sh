@@ -181,4 +181,5 @@ ok "sha256: $(cut -d' ' -f1 "$DIST/SHA256SUMS")"
 
 say "verifying by running every real call site"
 python3 "$HERE/verify.py" "$DIST/ffmpeg" --outdir "$WORK/verify-out" || die "verification FAILED"
+. "$HERE/build-info.sh"; drokk_ffmpeg_write_build_info "$HERE" "$DIST" linux-x86_64 ffmpeg || die "could not write $DIST/BUILD-INFO"
 ok "linux build complete: $DIST/ffmpeg"
