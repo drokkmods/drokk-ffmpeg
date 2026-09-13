@@ -404,16 +404,22 @@ def case_D1_dshow(ff, win, outdir):
     if NOT_COMPILED.search(err):
         return record("FAIL", name, "dshow indev is NOT COMPILED IN: "
                       + next(l for l in err.splitlines() if NOT_COMPILED.search(l)).strip()[:140])
-    if "DirectShow audio devices" not in err:
+    # Two listing formats: older ffmpeg prints a "DirectShow audio devices"
+    # header followed by quoted names; ffmpeg >= 5 prints one
+    # `"Name" (audio)` / `"Name" (video)` line per device and no header.
+    tagged = re.findall(r'"([^"]+)"\s+\((audio|video|none)\)', err)
+    if "DirectShow audio devices" not in err and not tagged:
         return record("FAIL", name,
-                      "-list_devices produced no DirectShow section: "
+                      "-list_devices produced no DirectShow device list: "
                       + err.strip().replace("\n", " ")[:150])
     open(os.path.join(outdir, "dshow-devices.txt"), "w").write(err)
 
-    # Names are printed quoted, one per line, after the audio-devices header.
-    tail = err.split("DirectShow audio devices", 1)[1]
-    names = [m for m in re.findall(r'"([^"]+)"', tail)
-             if not m.startswith("@device_")]
+    if tagged:
+        names = [n for n, kind in tagged if kind == "audio"]
+    else:
+        tail = err.split("DirectShow audio devices", 1)[1]
+        names = [m for m in re.findall(r'"([^"]+)"', tail)
+                 if not m.startswith("@device_")]
     if not names:
         return record("HWSKIP", name,
                       "dshow enumerated fine; this machine has no audio capture "
