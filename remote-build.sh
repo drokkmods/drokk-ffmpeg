@@ -116,7 +116,7 @@ say "built: $(stat -c%s "$WORK/ffmpeg/ffmpeg.exe") bytes"
 # stock Windows system DLL. nvEncodeAPI64.dll must NOT appear -- it is
 # LoadLibrary'd at runtime, which is what keeps this build free of --enable-nonfree.
 BAD="$(objdump -p "$WORK/ffmpeg/ffmpeg.exe" | grep -i 'DLL Name:' \
-       | grep -viE 'kernel32|user32|advapi32|ws2_32|secur32|bcrypt|shell32|ole32|psapi|msvcrt|ucrtbase|api-ms-win|iphlpapi|gdi32|version|shlwapi|mfplat|d3d11|dxgi|crypt32|winmm|cfgmgr32|ntdll|imm32|setupapi|vcruntime')" || true
+       | grep -viE 'kernel32|user32|advapi32|ws2_32|secur32|bcrypt|shell32|ole32|oleaut32|psapi|msvcrt|ucrtbase|api-ms-win|iphlpapi|gdi32|version|shlwapi|mfplat|d3d11|dxgi|crypt32|winmm|cfgmgr32|ntdll|imm32|setupapi|vcruntime')" || true
 [ -z "$BAD" ] || die "ffmpeg.exe has non-system DLL imports (not self-contained):
 $BAD"
 say "imports are stock system DLLs only"
