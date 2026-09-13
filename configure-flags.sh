@@ -5,9 +5,11 @@
 #
 # METHOD: start from --disable-everything and add back ONLY what the mods'
 # actual ffmpeg command lines prove they need. Every flag below is traceable to
-# a specific invocation; the seven of them are enumerated in README.md, and the
-# four audio-path additions are AUDIO_PLAN.md section 6. Do not add a flag
-# without a call site, and do not remove one without checking all seven.
+# a specific invocation; the seven of them are enumerated in README.md, the
+# four audio-path additions are AUDIO_PLAN.md section 6, and the turn-recording
+# remux additions (ogg demuxer, opus parser) are AUDIO_PLAN.md section 9.6. Do
+# not add a flag without a call site, and do not remove one without checking
+# all of the above.
 #
 # The single most important thing to know about this list: a WRONG list mostly
 # fails SILENTLY. Both Lethal Company and 7 Days treat a dead audio ffmpeg as a
@@ -99,9 +101,26 @@ drokk_ffmpeg_flags() {
 # back in as `-protocol_whitelist file,udp,rtp -i <sdp file>`. rtp_demuxer
 # selects sdp_demuxer which selects rtpdec, so `rtp` alone would drag both in,
 # but both are named because the call site names both.
---enable-demuxer=rawvideo,pcm_s16le,h264,rtp,sdp
+#
+# ogg: AUDIO_PLAN.md section 9.5/9.6. The sidecar's turn recorder writes
+# host.ogg/player.ogg with pion's oggwriter (section 9.4) and the end-of-turn
+# remux reads them back with `-i host.ogg -i player.ogg` before amix -- so the
+# ogg DEMUXER has to be in this ffmpeg even though nothing here ever writes an
+# Ogg container (oggwriter is pure Go, no cgo, section 0.2). Without it the
+# remux fails the section 3.4 way: the turn's .ogg files are left on disk and
+# the finished .mp4 is simply missing tracks, or missing entirely if it was the
+# only audio input.
+--enable-demuxer=rawvideo,pcm_s16le,h264,rtp,sdp,ogg
 --enable-muxer=h264,mp4,rtp,null,pcm_s16le
 --enable-parser=h264
+# opus: the ogg demuxer above hands ffmpeg a bare Opus stream inside the Ogg
+# container, and the OPUS PARSER (not the libopus decoder, already enabled
+# above) is what lets that stream be `-map`ped straight through with `-c copy`
+# -- section 9.5's stem tracks 2 and 3 are copied, never decoded. libopus is
+# only decoded on the path amix needs (track 1, "mix"). Confirmed against the
+# pinned 8.1.2 source: OPUS_PARSER exists as its own component, separate from
+# both the libopus encoder and decoder above.
+--enable-parser=opus
 --enable-bsf=h264_metadata
 
 # --- filters -----------------------------------------------------------------

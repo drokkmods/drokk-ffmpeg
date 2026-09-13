@@ -576,6 +576,276 @@ def case_D3_amix(ff, outdir):
     record("PASS", name,
            f"{len(packets)} RTP datagrams, SDP ok, and the mix differs from input 0 alone")
 
+# --- row 5: --enable-demuxer=ogg + --enable-parser=opus ----------------------
+#
+# AUDIO_PLAN.md section 9.5/9.6: the turn recorder's end-of-turn remux reads
+# back host.ogg/player.ogg (written live during the turn by pion's oggwriter --
+# pure Go, no cgo, section 0.2) and mixes them with amix into the finished MP4.
+# Nothing in this ffmpeg ever WRITES an Ogg container -- the shipped build has
+# no ogg muxer, deliberately (section 9.6 adds only the demuxer + the opus
+# parser, not a writer) -- so the fixtures below cannot be made with `-f ogg`.
+#
+# Instead: encode real, decodable Opus with the ffmpeg-under-test's OWN
+# libopus encoder, the same way case_audio()/case_D3_amix() already do (PCM
+# over a loopback TCP socket -> libopus -> RTP), capture the RTP payloads --
+# each one already is exactly one Opus packet -- and hand-frame them into a
+# minimal Ogg Opus file ourselves. That is real ffmpeg-encoded audio inside a
+# hand-built but spec-correct (RFC 3533 pages, RFC 7845 headers) Ogg
+# container, needing nothing beyond python and a loopback socket, per this
+# file's own header promise.
+
+_OGG_CRC_TABLE = None
+
+def _ogg_crc_table():
+    """libogg's crc_lookup, reproduced: poly 0x04c11db7, MSB-first, no
+    reflection, no final XOR -- NOT the same algorithm as zlib's crc32."""
+    global _OGG_CRC_TABLE
+    if _OGG_CRC_TABLE is None:
+        table = []
+        for i in range(256):
+            crc = i << 24
+            for _ in range(8):
+                crc = ((crc << 1) ^ 0x04c11db7) & 0xffffffff if crc & 0x80000000 \
+                      else (crc << 1) & 0xffffffff
+            table.append(crc)
+        _OGG_CRC_TABLE = table
+    return _OGG_CRC_TABLE
+
+def _ogg_crc32(data):
+    table = _ogg_crc_table()
+    crc = 0
+    for b in data:
+        crc = ((crc << 8) & 0xffffffff) ^ table[((crc >> 24) & 0xff) ^ b]
+    return crc
+
+def _ogg_lacing(nbytes):
+    """Segment-table lacing values for one packet of length nbytes (RFC 3533
+    section 6): as many 255s as fit, then the remainder -- ALWAYS at least one
+    entry, so an exact multiple of 255 still ends with a trailing 0."""
+    vals = []
+    n = nbytes
+    while n >= 255:
+        vals.append(255)
+        n -= 255
+    vals.append(n)
+    return vals
+
+def _ogg_page(serial, seqno, granulepos, packets, first=False, last=False):
+    """One Ogg page carrying one or more whole packets (none of our packets --
+    two ~19-byte header packets and ~100-200 byte Opus frames -- ever need
+    continuation across a page, so this does not implement that case)."""
+    header_type = (0x02 if first else 0) | (0x04 if last else 0)
+    segments = []
+    body = bytearray()
+    for p in packets:
+        segments += _ogg_lacing(len(p))
+        body += p
+    if len(segments) > 255:
+        raise ValueError("fixture packet(s) too large for one page's segment table")
+    page = bytearray()
+    page += b"OggS"
+    page += bytes([0])                                  # version
+    page += bytes([header_type])
+    page += struct.pack("<q", granulepos)
+    page += struct.pack("<I", serial)
+    page += struct.pack("<I", seqno)
+    page += struct.pack("<I", 0)                         # CRC placeholder
+    page += bytes([len(segments)])
+    page += bytes(segments)
+    page += body
+    crc = _ogg_crc32(bytes(page))
+    page[22:26] = struct.pack("<I", crc)
+    return bytes(page)
+
+def _opus_head(channels, sample_rate):
+    """RFC 7845 section 5.1, the mandatory ID header packet."""
+    return (b"OpusHead" + bytes([1]) + bytes([channels]) +
+            struct.pack("<H", 0) +                        # pre-skip
+            struct.pack("<I", sample_rate) +
+            struct.pack("<h", 0) +                        # output gain
+            bytes([0]))                                   # channel mapping 0
+
+def _opus_tags():
+    """RFC 7845 section 5.2, the mandatory comment header packet -- minimal,
+    zero user comments."""
+    vendor = b"drokk-ffmpeg verify.py"
+    return (b"OpusTags" + struct.pack("<I", len(vendor)) + vendor +
+            struct.pack("<I", 0))
+
+def opus_packets_via_encoder(ff, seconds, freq_hz=440, amp=8000):
+    """Feed a synthetic PCM tone through the binary-under-test's OWN libopus
+    encoder and RTP muxer (case_audio's exact plumbing) and return the list of
+    raw Opus packets it produced, stripped of their RTP headers.
+
+    None of this depends on the ogg demuxer/opus parser being buildable --
+    it only needs the libopus ENCODER and rtp MUXER, both already enabled by
+    A1 -- so it works as a fixture generator even on a pre-section-9.6 binary,
+    which is exactly what lets this fixture path be reused unconditionally."""
+    import math
+    n = SAMPLE_RATE * seconds
+    buf = bytearray()
+    for i in range(n):
+        v = int(amp * math.sin(2 * math.pi * freq_hz * i / SAMPLE_RATE))
+        buf += struct.pack("<hh", v, v)
+    pcm = bytes(buf)
+
+    port = serve_pcm_over_tcp(pcm)
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp.bind(("127.0.0.1", 0)); udp.settimeout(0.5)
+    udp_port = udp.getsockname()[1]
+    packets, stop = [], threading.Event()
+    def recv():
+        while not stop.is_set():
+            try: packets.append(udp.recv(4096))
+            except socket.timeout: pass
+            except OSError: return
+    r = threading.Thread(target=recv, daemon=True); r.start()
+
+    args = ["-hide_banner", "-loglevel", "warning",
+            "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
+            "-i", f"tcp://127.0.0.1:{port}",
+            "-c:a", "libopus", "-b:a", "64k", "-application", "voip",
+            "-frame_duration", "20",
+            "-f", "rtp", f"rtp://127.0.0.1:{udp_port}"]
+    try:
+        rc, out, err = run(ff, args, timeout=60)
+    finally:
+        stop.set(); time.sleep(0.8); r.join(timeout=2)
+        try: udp.close()
+        except OSError: pass
+    if rc != 0:
+        raise RuntimeError("fixture encode failed: " + (err.strip().splitlines() or ["?"])[-1])
+    if not packets:
+        raise RuntimeError("fixture encode produced no RTP datagrams")
+
+    opus_frames = []
+    for pkt in packets:
+        if len(pkt) < 12:
+            continue
+        b0 = pkt[0]
+        if (b0 >> 6) != 2:
+            continue                                      # not RTP v2, skip
+        cc = b0 & 0x0f
+        ext = (b0 >> 4) & 0x01
+        off = 12 + 4 * cc
+        if ext:
+            if len(pkt) < off + 4:
+                continue
+            ext_len_words = struct.unpack(">H", pkt[off + 2:off + 4])[0]
+            off += 4 + 4 * ext_len_words
+        if off < len(pkt):
+            opus_frames.append(pkt[off:])
+    if not opus_frames:
+        raise RuntimeError("captured RTP datagrams but extracted no Opus payloads")
+    return opus_frames
+
+def synth_ogg_opus(ff, seconds, serial, freq_hz=440):
+    """Build a spec-correct Ogg Opus file (RFC 3533 pages + RFC 7845 headers)
+    around real Opus packets from opus_packets_via_encoder(). This stands in
+    for pion's oggwriter (section 9.4) -- byte-different, container-equivalent."""
+    frames = opus_packets_via_encoder(ff, seconds, freq_hz=freq_hz)
+    out = bytearray()
+    out += _ogg_page(serial, 0, 0, [_opus_head(CHANNELS, SAMPLE_RATE)], first=True)
+    out += _ogg_page(serial, 1, 0, [_opus_tags()])
+    samples_per_frame = SAMPLE_RATE // 50                 # 20 ms @ 48 kHz = 960
+    granule = 0
+    for i, frame in enumerate(frames):
+        granule += samples_per_frame
+        out += _ogg_page(serial, 2 + i, granule, [frame], last=(i == len(frames) - 1))
+    return bytes(out)
+
+def _stream_kinds(text):
+    """Parse `ffmpeg -i <file>` stderr (ffprobe is --disable-ffprobe'd out of
+    this build, section shape note in configure-flags.sh's --- shape --- block)
+    into a list of 'Video'/'Audio'/other per `Stream #0:N` line."""
+    kinds = []
+    for line in text.splitlines():
+        m = re.search(r"Stream #\d+:\d+.*?:\s*(Video|Audio|Subtitle|Data)\b", line)
+        if m:
+            kinds.append(m.group(1))
+    return kinds
+
+def case_R1_recording_remux(ff, video_h264, outdir):
+    """AUDIO_PLAN.md section 9.5's exact remux, two-audio-input case: video +
+    host.ogg + player.ogg -> mp4 with track 0 the libopus-remixed 'Mixed' pair
+    and tracks 1-2 the untouched stems, `-c copy`d straight out of the ogg
+    demuxer. This is the check the whole section 9.6 rebuild exists for."""
+    name = "R1 recording remux: video.h264 + host.ogg + player.ogg -> mp4 (1v+3a)"
+    if not video_h264:
+        return record("SKIP", name, "no upstream video.h264 fixture (V1 must have produced one)")
+
+    host_ogg = os.path.join(outdir, "host.ogg")
+    player_ogg = os.path.join(outdir, "player.ogg")
+    try:
+        open(host_ogg, "wb").write(synth_ogg_opus(ff, 1, serial=0x686f7374, freq_hz=440))
+        open(player_ogg, "wb").write(synth_ogg_opus(ff, 1, serial=0x706c6172, freq_hz=660))
+    except RuntimeError as e:
+        return record("FAIL", name, "could not synthesise Ogg Opus fixtures: " + str(e))
+
+    mp4 = os.path.join(outdir, "recording-remux.mp4")
+    args = ["-hide_banner", "-loglevel", "warning", "-y",
+            "-r", str(FPS), "-i", video_h264,
+            "-itsoffset", "0.30", "-i", host_ogg,
+            "-itsoffset", "0.60", "-i", player_ogg,
+            "-filter_complex", "[1:a][2:a]amix=inputs=2:duration=longest:normalize=0[mix]",
+            "-map", "0:v", "-map", "[mix]", "-map", "1:a", "-map", "2:a",
+            "-c:v", "copy", "-c:a:0", "libopus", "-b:a:0", "128k",
+            "-c:a:1", "copy", "-c:a:2", "copy",
+            "-metadata:s:a:0", "title=Mixed", "-metadata:s:a:1", "title=Host",
+            "-metadata:s:a:2", "title=Player",
+            "-movflags", "+faststart", mp4]
+    rc, out, err = run(ff, args, timeout=60)
+    if rc != 0 or not os.path.exists(mp4):
+        return record("FAIL", name, (err.strip().splitlines() or ["no file"])[-1][:200])
+    head = open(mp4, "rb").read(12)
+    if head[4:8] != b"ftyp":
+        return record("FAIL", name, "output is not ISO-BMFF")
+
+    rc2, out2, err2 = run(ff, ["-hide_banner", "-i", mp4])
+    kinds = _stream_kinds(out2.decode("utf-8", "replace") + err2)
+    nv, na = kinds.count("Video"), kinds.count("Audio")
+    if nv != 1 or na != 3:
+        return record("FAIL", name,
+                      f"expected 1 video + 3 audio streams, got {nv} video + {na} audio "
+                      f"(streams: {kinds})")
+    record("PASS", name, f"{os.path.getsize(mp4)} bytes, ftyp ok, {nv}v+{na}a -> {mp4}")
+
+def case_R2_recording_remux_single_audio(ff, video_h264, outdir):
+    """AUDIO_PLAN.md section 9.5's one-audio-input case: "with one audio input
+    it is copied as the only track, no filter". Same fixtures, host.ogg only."""
+    name = "R2 recording remux: video.h264 + host.ogg only -> mp4 (1v+1a, no filter)"
+    if not video_h264:
+        return record("SKIP", name, "no upstream video.h264 fixture (V1 must have produced one)")
+
+    host_ogg = os.path.join(outdir, "host-only.ogg")
+    try:
+        open(host_ogg, "wb").write(synth_ogg_opus(ff, 1, serial=0x686f3245, freq_hz=550))
+    except RuntimeError as e:
+        return record("FAIL", name, "could not synthesise Ogg Opus fixture: " + str(e))
+
+    mp4 = os.path.join(outdir, "recording-remux-single.mp4")
+    args = ["-hide_banner", "-loglevel", "warning", "-y",
+            "-r", str(FPS), "-i", video_h264,
+            "-itsoffset", "0.30", "-i", host_ogg,
+            "-map", "0:v", "-map", "1:a",
+            "-c:v", "copy", "-c:a", "copy",
+            "-movflags", "+faststart", mp4]
+    rc, out, err = run(ff, args, timeout=60)
+    if rc != 0 or not os.path.exists(mp4):
+        return record("FAIL", name, (err.strip().splitlines() or ["no file"])[-1][:200])
+    head = open(mp4, "rb").read(12)
+    if head[4:8] != b"ftyp":
+        return record("FAIL", name, "output is not ISO-BMFF")
+
+    rc2, out2, err2 = run(ff, ["-hide_banner", "-i", mp4])
+    kinds = _stream_kinds(out2.decode("utf-8", "replace") + err2)
+    nv, na = kinds.count("Video"), kinds.count("Audio")
+    if nv != 1 or na != 1:
+        return record("FAIL", name,
+                      f"expected 1 video + 1 audio stream, got {nv} video + {na} audio "
+                      f"(streams: {kinds})")
+    record("PASS", name, f"{os.path.getsize(mp4)} bytes, ftyp ok, {nv}v+{na}a -> {mp4}")
+
 # --- row 4: --enable-decoder=libopus + --enable-demuxer=sdp,rtp --------------
 
 def case_D4_rtp_decode(ff, outdir):
@@ -702,6 +972,10 @@ def main():
     case_D2_pulse_alsa(ff, win)
     case_D3_amix(ff, a.outdir)
     case_D4_rtp_decode(ff, a.outdir)
+
+    print("\n== AUDIO_PLAN.md section 9.6: the turn-recording remux ==")
+    case_R1_recording_remux(ff, v1, a.outdir)
+    case_R2_recording_remux_single_audio(ff, v1, a.outdir)
 
     n_fail = sum(1 for s, _, _ in results if s == "FAIL")
     n_hw   = sum(1 for s, _, _ in results if s == "HWSKIP")
