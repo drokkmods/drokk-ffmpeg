@@ -56,10 +56,15 @@ drokk_ffmpeg_require_built_from() {
 }
 
 # drokk_ffmpeg_write_build_info <repo> <dist-dir> <flavour> <binary-name>
-# Needs FFMPEG_TAG / FFMPEG_COMMIT from PINNED already in the environment.
+# Reads FFMPEG_TAG / FFMPEG_COMMIT from PINNED itself: build-win64.sh never
+# sources PINNED locally (remote-build.sh does, on the build box).
 drokk_ffmpeg_write_build_info() {
   local repo="$1" dist="$2" flavour="$3" bin="$4" dirty=0
   [ -f "$dist/$bin" ] || { echo "==> ERROR: BUILD-INFO: no $dist/$bin" >&2; return 1; }
+  local FFMPEG_TAG FFMPEG_COMMIT
+  FFMPEG_TAG="$(sed -n 's/^FFMPEG_TAG=//p' "$repo/PINNED")"
+  FFMPEG_COMMIT="$(sed -n 's/^FFMPEG_COMMIT=//p' "$repo/PINNED")"
+  [ -n "$FFMPEG_TAG" ] && [ -n "$FFMPEG_COMMIT" ] || { echo "==> ERROR: BUILD-INFO: FFMPEG_TAG/FFMPEG_COMMIT missing from $repo/PINNED" >&2; return 1; }
   [ -n "$(git -C "$repo" status --porcelain -- "${DROKK_FFMPEG_RECIPE[@]}")" ] && dirty=1
   cat > "$dist/BUILD-INFO.tmp" <<EOF || return 1
 # drokk-ffmpeg BUILD-INFO -- written by the build, never by hand. See build-info.sh.
