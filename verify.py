@@ -152,13 +152,14 @@ def classify_nvenc_failure(err):
 STATIC = [
     ("-encoders",  [r"\blibx264\b", r"\bh264_nvenc\b", r"\blibopus\b", r"\bpcm_s16le\b"]),
     ("-decoders",  [r"\brawvideo\b", r"\bpcm_s16le\b", r"\blibopus\b"]),
-    ("-demuxers",  [r"\brawvideo\b", r"\bs16le\b", r"\bh264\b", r"\brtp\b", r"\bsdp\b"]),
+    ("-demuxers",  [r"\brawvideo\b", r"\bs16le\b", r"\bh264\b", r"\bogg\b"]),
     ("-muxers",    [r"\bh264\b", r"\bmp4\b", r"\brtp\b", r"\bnull\b", r"\bs16le\b"]),
     ("-devices",   [r"\blavfi\b"]),
     ("-bsfs",      [r"\bh264_metadata\b"]),
     ("-protocols", [r"\bpipe\b", r"\bfile\b", r"\btcp\b", r"\budp\b", r"\brtp\b"]),
     ("-filters",   [r"\bscale\b", r"\bformat\b", r"\baformat\b", r"\baresample\b",
-                    r"\bvflip\b", r"\bcolor\b", r"\bnull\b", r"\banull\b", r"\bamix\b"]),
+                    r"\bvflip\b", r"\bcolor\b", r"\bnull\b", r"\banull\b", r"\bamix\b",
+                    r"\bpan\b", r"\bamerge\b", r"\bapad\b"]),
 ]
 
 # The capture/playback devices are the ONE place the two builds legitimately
@@ -508,42 +509,53 @@ def case_D3_amix(ff, outdir):
     mic_path = os.path.join(outdir, "amix-mic.s16le")
     open(mic_path, "wb").write(quiet_tone(seconds=AUDIO_SECONDS, amp=6000))
 
-    # (a) the real thing: mixed -> libopus -> RTP on the wire.
+    # (a) the real thing: mixed -> libopus -> RTP on the wire, PLUS the mic
+    # input a second time straight to its own RTP output (AUDIO_PLAN.md section
+    # 9.10: the recorder's host-mic-only stream, stdin type 4). One input feeds
+    # both the filter graph and a direct -map; both ports must receive packets.
     port = serve_pcm_over_tcp(game)
-    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp.bind(("127.0.0.1", 0)); udp.settimeout(0.5)
-    udp_port = udp.getsockname()[1]
-    packets, stop = [], threading.Event()
-    def recv():
-        while not stop.is_set():
-            try: packets.append(udp.recv(4096))
-            except socket.timeout: pass
-            except OSError: return
-    r = threading.Thread(target=recv, daemon=True); r.start()
+    stop = threading.Event()
+    def listener():
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("127.0.0.1", 0)); s.settimeout(0.5)
+        got = []
+        def recv():
+            while not stop.is_set():
+                try: got.append(s.recv(4096))
+                except socket.timeout: pass
+                except OSError: return
+        t = threading.Thread(target=recv, daemon=True); t.start()
+        return s, got, t
+    udp, packets, r = listener()
+    mic_udp, mic_packets, mic_r = listener()
+    opus_out = ["-c:a", "libopus", "-b:a", "64k", "-application", "lowdelay", "-frame_duration", "20"]
 
-    args = ["-hide_banner", "-loglevel", "warning",
-            "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
-            "-i", f"tcp://127.0.0.1:{port}",
-            "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
-            "-i", mic_path,
-            "-filter_complex",
-            "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0[a]",
-            "-map", "[a]",
-            "-c:a", "libopus", "-b:a", "64k", "-application", "lowdelay",
-            "-frame_duration", "20",
-            "-f", "rtp", f"rtp://127.0.0.1:{udp_port}"]
+    args = (["-hide_banner", "-loglevel", "warning",
+             "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
+             "-i", f"tcp://127.0.0.1:{port}",
+             "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
+             "-i", mic_path,
+             "-filter_complex",
+             "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0[a]",
+             "-map", "[a]"] + opus_out +
+            ["-f", "rtp", f"rtp://127.0.0.1:{udp.getsockname()[1]}",
+             "-map", "1:a"] + opus_out +
+            ["-f", "rtp", f"rtp://127.0.0.1:{mic_udp.getsockname()[1]}"])
     try:
         rc, out, err = run(ff, args, timeout=60)
     finally:
-        stop.set(); time.sleep(0.8); r.join(timeout=2)
-        try: udp.close()
-        except OSError: pass
+        stop.set(); time.sleep(0.8); r.join(timeout=2); mic_r.join(timeout=2)
+        for s in (udp, mic_udp):
+            try: s.close()
+            except OSError: pass
 
     if rc != 0:
         return record("FAIL", name, (err.strip().splitlines() or ["rc=%d" % rc])[-1][:160])
     sdp = out.decode("utf-8", "replace")
     if not packets:
         return record("FAIL", name, "ffmpeg exited 0 but NO RTP datagrams arrived")
+    if not mic_packets:
+        return record("FAIL", name, "the mix arrived but the mic-only second RTP output sent nothing")
     if "m=audio" not in sdp or "opus/48000/2" not in sdp:
         return record("FAIL", name, "SDP missing m=audio/opus: " + sdp.replace("\n", " ")[:140])
 
@@ -765,55 +777,116 @@ def _stream_kinds(text):
             kinds.append(m.group(1))
     return kinds
 
+AUDIO_DUR = NFRAMES / FPS  # the V1 fixture's duration: every track is padded and cut to it
+
+def _remux_ok(ff, name, args, mp4, want_audio):
+    """Run a remux (args at -loglevel info), then confirm ISO-BMFF with 1 video
+    + want_audio audio streams. Returns True, or records the FAIL and returns
+    False.
+
+    The streams are read from the remux's OWN stderr, not by opening the mp4
+    back up: this build has the mp4 muxer but no mov demuxer, deliberately
+    (nothing in production reads an mp4). The demuxer used to be present only
+    as a dependency of the rtp demuxer, which section 4.2's move to Ogg on
+    stdin removed."""
+    rc, out, err = run(ff, args, timeout=60)
+    if rc != 0 or not os.path.exists(mp4):
+        record("FAIL", name, (err.strip().splitlines() or ["no file"])[-1][:200])
+        return False
+    if open(mp4, "rb").read(12)[4:8] != b"ftyp":
+        record("FAIL", name, "output is not ISO-BMFF")
+        return False
+    parts = err.split("Output #0", 1)
+    kinds = _stream_kinds(parts[1]) if len(parts) == 2 else []
+    nv, na = kinds.count("Video"), kinds.count("Audio")
+    if nv != 1 or na != want_audio:
+        record("FAIL", name, f"expected 1 video + {want_audio} audio streams, got {nv} video + "
+                             f"{na} audio (streams: {kinds}) -- -shortest drops filtered audio "
+                             "this way, so check nobody reintroduced it")
+        return False
+    return True
+
+def _window_peaks(pcm, start, dur):
+    """(left peak, right peak) of stereo s16le pcm over [start, start+dur)."""
+    a = int(start * SAMPLE_RATE) * 4
+    b = int((start + dur) * SAMPLE_RATE) * 4
+    samples = [v for (v,) in struct.iter_unpack("<h", pcm[a:b][:(b - a) // 4 * 4])]
+    return (max((abs(v) for v in samples[0::2]), default=0),
+            max((abs(v) for v in samples[1::2]), default=0))
+
 def case_R1_recording_remux(ff, video_h264, outdir):
-    """AUDIO_PLAN.md section 9.5's exact remux, two-audio-input case: video +
-    host.ogg + player.ogg -> mp4 with track 0 the libopus-remixed 'Mixed' pair
-    and tracks 1-2 the untouched stems, `-c copy`d straight out of the ogg
-    demuxer. This is the check the whole section 9.6 rebuild exists for."""
-    name = "R1 recording remux: video.h264 + host.ogg + player.ogg -> mp4 (1v+3a)"
+    """AUDIO_PLAN.md section 9.5's exact remux, all three inputs: video.h264 +
+    host.ogg (game + host mic) + hostmic.ogg + player.ogg -> mp4 with track 0
+    "Game + voices" and track 1 "Voices (L host, R player)". Exercises every
+    filter the section 9.6 rebuild added (pan, amerge, apad) plus aresample's
+    async padding, then DECODES track 1 to prove the voices landed on their own
+    sides: host mic from 0.0s, player from 0.6s, so the right channel must be
+    silent before the player starts and loud after."""
+    name = "R1 recording remux: video + host.ogg + hostmic.ogg + player.ogg -> mp4 (1v+2a, L/R voices)"
     if not video_h264:
         return record("SKIP", name, "no upstream video.h264 fixture (V1 must have produced one)")
 
     host_ogg = os.path.join(outdir, "host.ogg")
+    mic_ogg = os.path.join(outdir, "hostmic.ogg")
     player_ogg = os.path.join(outdir, "player.ogg")
     try:
         open(host_ogg, "wb").write(synth_ogg_opus(ff, 1, serial=0x686f7374, freq_hz=440))
+        open(mic_ogg, "wb").write(synth_ogg_opus(ff, 1, serial=0x6d696373, freq_hz=550))
         open(player_ogg, "wb").write(synth_ogg_opus(ff, 1, serial=0x706c6172, freq_hz=660))
     except RuntimeError as e:
         return record("FAIL", name, "could not synthesise Ogg Opus fixtures: " + str(e))
 
+    d = f"{AUDIO_DUR:.3f}"
+    aligned = "aresample=async=1:first_pts=0"
+    mono = "aformat=channel_layouts=stereo,pan=mono|c0=0.5*c0+0.5*c1"
+    graph = ";".join([
+        f"[1:a]{aligned}[m0]",
+        f"[3:a]{aligned}[m1]",
+        f"[m0][m1]amix=inputs=2:duration=longest:normalize=0,apad=whole_dur={d}[mixed]",
+        f"[2:a]{aligned},{mono},apad=whole_dur={d}[vl]",
+        f"[3:a]{aligned},{mono},apad=whole_dur={d}[vr]",
+        "[vl][vr]amerge=inputs=2,pan=stereo|c0=c0|c1=c1[voices]",
+    ])
+    inputs = ["-r", str(FPS), "-i", video_h264,
+              "-itsoffset", "0.000", "-i", host_ogg,
+              "-itsoffset", "0.000", "-i", mic_ogg,
+              "-itsoffset", "0.600", "-i", player_ogg]
     mp4 = os.path.join(outdir, "recording-remux.mp4")
-    args = ["-hide_banner", "-loglevel", "warning", "-y",
-            "-r", str(FPS), "-i", video_h264,
-            "-itsoffset", "0.30", "-i", host_ogg,
-            "-itsoffset", "0.60", "-i", player_ogg,
-            "-filter_complex", "[1:a][2:a]amix=inputs=2:duration=longest:normalize=0[mix]",
-            "-map", "0:v", "-map", "[mix]", "-map", "1:a", "-map", "2:a",
-            "-c:v", "copy", "-c:a:0", "libopus", "-b:a:0", "128k",
-            "-c:a:1", "copy", "-c:a:2", "copy",
-            "-metadata:s:a:0", "title=Mixed", "-metadata:s:a:1", "title=Host",
-            "-metadata:s:a:2", "title=Player",
-            "-movflags", "+faststart", mp4]
-    rc, out, err = run(ff, args, timeout=60)
-    if rc != 0 or not os.path.exists(mp4):
-        return record("FAIL", name, (err.strip().splitlines() or ["no file"])[-1][:200])
-    head = open(mp4, "rb").read(12)
-    if head[4:8] != b"ftyp":
-        return record("FAIL", name, "output is not ISO-BMFF")
+    args = (["-hide_banner", "-loglevel", "info", "-y"] + inputs +
+            ["-filter_complex", graph,
+             "-map", "0:v", "-map", "[mixed]", "-map", "[voices]",
+             "-c:v", "copy", "-c:a", "libopus", "-b:a:0", "128k",
+             "-metadata:s:a:0", "title=Game + voices",
+             "-b:a:1", "96k", "-metadata:s:a:1", "title=Voices (L host, R player)",
+             "-t", d, "-movflags", "+faststart", mp4])
+    if not _remux_ok(ff, name, args, mp4, want_audio=2):
+        return
 
-    rc2, out2, err2 = run(ff, ["-hide_banner", "-i", mp4])
-    kinds = _stream_kinds(out2.decode("utf-8", "replace") + err2)
-    nv, na = kinds.count("Video"), kinds.count("Audio")
-    if nv != 1 or na != 3:
-        return record("FAIL", name,
-                      f"expected 1 video + 3 audio streams, got {nv} video + {na} audio "
-                      f"(streams: {kinds})")
-    record("PASS", name, f"{os.path.getsize(mp4)} bytes, ftyp ok, {nv}v+{na}a -> {mp4}")
+    # The same graph rendered straight to PCM (see _remux_ok for why the mp4
+    # itself cannot be decoded by this build). [mixed] must go somewhere or
+    # the graph has an unconnected output.
+    rc, pcm, err = run(ff, ["-hide_banner", "-loglevel", "error"] + inputs +
+                           ["-filter_complex", graph,
+                            "-map", "[voices]", "-t", d, "-f", "s16le", "-ac", "2", "pipe:1",
+                            "-map", "[mixed]", "-t", d, "-f", "null", "-"], timeout=60)
+    if rc != 0 or not pcm:
+        return record("FAIL", name, "rendering the voices track to PCM failed: "
+                      + (err.strip().splitlines() or ["rc=%d" % rc])[-1][:160])
+    early_l, early_r = _window_peaks(pcm, 0.05, 0.4)
+    late_l, late_r = _window_peaks(pcm, 0.7, 0.25)
+    if early_l < 1000 or late_r < 1000:
+        return record("FAIL", name, f"voices track missing a voice: L peak {early_l} at 0.05s, "
+                                    f"R peak {late_r} at 0.7s (want both audible)")
+    if early_r > 300:
+        return record("FAIL", name, f"right channel has sound (peak {early_r}) before the player "
+                                    "started -- the -itsoffset was lost, or the voices are not split")
+    record("PASS", name, f"{os.path.getsize(mp4)} bytes, 1v+2a, voices L={early_l} R(before)={early_r} "
+                         f"R(after)={late_r} -> {mp4}")
 
 def case_R2_recording_remux_single_audio(ff, video_h264, outdir):
-    """AUDIO_PLAN.md section 9.5's one-audio-input case: "with one audio input
-    it is copied as the only track, no filter". Same fixtures, host.ogg only."""
-    name = "R2 recording remux: video.h264 + host.ogg only -> mp4 (1v+1a, no filter)"
+    """AUDIO_PLAN.md section 9.5's game-audio-only case (no mic either side):
+    one filtered track padded to the video, no voices track."""
+    name = "R2 recording remux: video.h264 + host.ogg only -> mp4 (1v+1a)"
     if not video_h264:
         return record("SKIP", name, "no upstream video.h264 fixture (V1 must have produced one)")
 
@@ -823,95 +896,59 @@ def case_R2_recording_remux_single_audio(ff, video_h264, outdir):
     except RuntimeError as e:
         return record("FAIL", name, "could not synthesise Ogg Opus fixture: " + str(e))
 
+    d = f"{AUDIO_DUR:.3f}"
     mp4 = os.path.join(outdir, "recording-remux-single.mp4")
-    args = ["-hide_banner", "-loglevel", "warning", "-y",
+    args = ["-hide_banner", "-loglevel", "info", "-y",
             "-r", str(FPS), "-i", video_h264,
-            "-itsoffset", "0.30", "-i", host_ogg,
-            "-map", "0:v", "-map", "1:a",
-            "-c:v", "copy", "-c:a", "copy",
-            "-movflags", "+faststart", mp4]
-    rc, out, err = run(ff, args, timeout=60)
-    if rc != 0 or not os.path.exists(mp4):
-        return record("FAIL", name, (err.strip().splitlines() or ["no file"])[-1][:200])
-    head = open(mp4, "rb").read(12)
-    if head[4:8] != b"ftyp":
-        return record("FAIL", name, "output is not ISO-BMFF")
-
-    rc2, out2, err2 = run(ff, ["-hide_banner", "-i", mp4])
-    kinds = _stream_kinds(out2.decode("utf-8", "replace") + err2)
-    nv, na = kinds.count("Video"), kinds.count("Audio")
-    if nv != 1 or na != 1:
-        return record("FAIL", name,
-                      f"expected 1 video + 1 audio stream, got {nv} video + {na} audio "
-                      f"(streams: {kinds})")
-    record("PASS", name, f"{os.path.getsize(mp4)} bytes, ftyp ok, {nv}v+{na}a -> {mp4}")
+            "-itsoffset", "0.300", "-i", host_ogg,
+            "-filter_complex", f"[1:a]aresample=async=1:first_pts=0,apad=whole_dur={d}[mixed]",
+            "-map", "0:v", "-map", "[mixed]",
+            "-c:v", "copy", "-c:a", "libopus", "-b:a:0", "128k",
+            "-metadata:s:a:0", "title=Game + voices",
+            "-t", d, "-movflags", "+faststart", mp4]
+    if not _remux_ok(ff, name, args, mp4, want_audio=1):
+        return
+    record("PASS", name, f"{os.path.getsize(mp4)} bytes, 1v+1a -> {mp4}")
 
 # --- row 4: --enable-decoder=libopus + --enable-demuxer=sdp,rtp --------------
 
-def case_D4_rtp_decode(ff, outdir):
-    """AUDIO_PLAN.md section 4.2's sidecar leg, verbatim:
-        -protocol_whitelist file,udp,rtp -i <sdp file> -f s16le -ar 48000 -ac 2 -
-    This is the direction that does not exist today at all, so nothing else in
-    the tree would notice these components missing.
+def case_D4_ogg_stdin_decode(ff, outdir):
+    """AUDIO_PLAN.md section 4.2's sidecar leg, verbatim (internal/sidecar's
+    playerMicInputArgs followed by the Windows decode args):
+        -fflags nobuffer -probesize 32 -analyzeduration 0 -f ogg -i pipe:0
+        -f s16le -ar 48000 -ac 2 -
+    The sidecar writes the player's jitter-buffered Opus into ffmpeg's stdin
+    as Ogg (pion's oggwriter). This replaced an SDP/RTP-over-loopback-UDP input
+    whose rtp demuxer needed a second, unreserved port for RTCP and lost the
+    player's voice for a whole turn when another process held it.
 
-    Three components have to line up: the sdp demuxer to read the file, the rtp
-    demuxer to read the socket, and the libopus DECODER -- which the pre-A1
-    builds did not have, having enabled only the libopus encoder."""
-    name = "D4 SDP/RTP -> libopus decode -> s16le"
-
-    # An SDP has to name a port before anything is listening on it, so: run the
-    # section 3.2 sender once to a chosen port purely to capture the SDP text it
-    # prints, then bring the receiver up on that SDP and run the sender again.
-    port = free_udp_port()
-    def send():
-        p = serve_pcm_over_tcp(pcm_s16le())
-        return run(ff, ["-hide_banner", "-loglevel", "warning",
-                        "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
-                        "-i", f"tcp://127.0.0.1:{p}",
-                        "-c:a", "libopus", "-b:a", "64k",
-                        "-application", "lowdelay", "-frame_duration", "20",
-                        "-f", "rtp", f"rtp://127.0.0.1:{port}"], timeout=60)
-
-    rc, out, err = send()
-    sdp_text = out.decode("utf-8", "replace")
-    if rc != 0 or "m=audio" not in sdp_text:
-        return record("FAIL", name, "could not produce an SDP to decode: "
-                      + (err.strip().splitlines() or ["rc=%d" % rc])[-1][:140])
-    sdp_path = os.path.join(outdir, "inbound.sdp")
-    open(sdp_path, "w").write(sdp_text)
-    pcm_path = os.path.join(outdir, "inbound.s16le")
-
-    recv = subprocess.Popen(
-        [ff, "-hide_banner", "-loglevel", "warning", "-y",
-         "-protocol_whitelist", "file,udp,rtp", "-i", sdp_path,
-         "-t", "1", "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
-         pcm_path],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    time.sleep(1.0)                      # let the demuxer bind before we send
-    if recv.poll() is not None:          # died on startup == missing component
-        e = recv.stderr.read().decode("utf-8", "replace")
-        s, d = classify_device_failure("sdp/rtp demuxer or libopus decoder", e)
-        return record(s, name, d)
-
-    send()
+    Two components have to line up: the ogg demuxer reading a non-seekable
+    pipe, and the libopus DECODER -- which the pre-A1 builds did not have,
+    having enabled only the libopus encoder."""
+    name = "D4 Ogg Opus on stdin -> libopus decode -> s16le"
     try:
-        _, rerr = recv.communicate(timeout=30)
-    except subprocess.TimeoutExpired:
-        recv.kill(); _, rerr = recv.communicate()
-    rerr = rerr.decode("utf-8", "replace")
+        ogg = synth_ogg_opus(ff, 1, serial=0x706d6963, freq_hz=440)
+    except RuntimeError as e:
+        return record("FAIL", name, "could not synthesise an Ogg Opus fixture: " + str(e))
 
-    if not os.path.exists(pcm_path) or os.path.getsize(pcm_path) == 0:
-        s, d = classify_device_failure("sdp/rtp demuxer or libopus decoder", rerr)
-        return record(s, name, d)
-    data = open(pcm_path, "rb").read()
-    # Decoded, not merely muxed: silence would mean the opus frames never made
-    # it through the decoder.
-    peak = max(abs(v) for v, in struct.iter_unpack("<h", data[:len(data) // 2 * 2]))
+    args = ["-hide_banner", "-loglevel", "warning",
+            "-fflags", "nobuffer", "-probesize", "32", "-analyzeduration", "0",
+            "-f", "ogg", "-i", "pipe:0",
+            "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS), "-"]
+    rc, out, err = run(ff, args, stdin=ogg, timeout=60)
+    if rc != 0 or not out:
+        return record("FAIL", name, "ogg demuxer or libopus decoder: "
+                      + (err.strip().splitlines() or ["rc=%d, no output" % rc])[-1][:160])
+    pcm_path = os.path.join(outdir, "inbound.s16le")
+    open(pcm_path, "wb").write(out)
+    # Decoded, not merely demuxed: silence would mean the opus frames never
+    # made it through the decoder.
+    peak = max(abs(v) for v, in struct.iter_unpack("<h", out[:len(out) // 2 * 2]))
     if peak < 500:
         return record("FAIL", name,
-                      f"{len(data)} bytes of s16le but peak amplitude {peak} -- decoded silence")
+                      f"{len(out)} bytes of s16le but peak amplitude {peak} -- decoded silence")
     record("PASS", name,
-           f"{len(data)} bytes s16le, peak {peak}, from an RTP/SDP opus stream -> {pcm_path}")
+           f"{len(out)} bytes s16le, peak {peak}, from Ogg Opus on stdin -> {pcm_path}")
 
 # --- main --------------------------------------------------------------------
 
@@ -971,7 +1008,7 @@ def main():
     case_D1_dshow(ff, win, a.outdir)
     case_D2_pulse_alsa(ff, win)
     case_D3_amix(ff, a.outdir)
-    case_D4_rtp_decode(ff, a.outdir)
+    case_D4_ogg_stdin_decode(ff, a.outdir)
 
     print("\n== AUDIO_PLAN.md section 9.6: the turn-recording remux ==")
     case_R1_recording_remux(ff, v1, a.outdir)

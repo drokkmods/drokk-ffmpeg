@@ -97,20 +97,18 @@ drokk_ffmpeg_flags() {
 # That is a silent audio-only failure; it was caught by running the binary.
 # The same trap applies to the pcm_s16le MUXER on the --enable-muxer line.
 #
-# rtp,sdp: AUDIO_PLAN.md section 4.2 feeds the sidecar's jitter-buffer output
-# back in as `-protocol_whitelist file,udp,rtp -i <sdp file>`. rtp_demuxer
-# selects sdp_demuxer which selects rtpdec, so `rtp` alone would drag both in,
-# but both are named because the call site names both.
-#
-# ogg: AUDIO_PLAN.md section 9.5/9.6. The sidecar's turn recorder writes
-# host.ogg/player.ogg with pion's oggwriter (section 9.4) and the end-of-turn
-# remux reads them back with `-i host.ogg -i player.ogg` before amix -- so the
-# ogg DEMUXER has to be in this ffmpeg even though nothing here ever writes an
-# Ogg container (oggwriter is pure Go, no cgo, section 0.2). Without it the
-# remux fails the section 3.4 way: the turn's .ogg files are left on disk and
-# the finished .mp4 is simply missing tracks, or missing entirely if it was the
-# only audio input.
---enable-demuxer=rawvideo,pcm_s16le,h264,rtp,sdp,ogg
+# ogg: two call sites, both fed by pion's oggwriter (pure Go, no cgo, section
+# 0.2), so nothing here ever WRITES an Ogg container:
+#  - AUDIO_PLAN.md section 4.2, the sidecar's player-mic decode: the jitter
+#    buffer's output arrives as `-f ogg -i pipe:0`. This REPLACED the original
+#    `-protocol_whitelist file,udp,rtp -i <sdp file>` input, and with it the
+#    rtp and sdp demuxers: the rtp demuxer binds the SDP's port AND port+1 for
+#    RTCP, nothing had reserved port+1, and on a host where another process
+#    held it the player went unheard for the whole turn (WSAEADDRINUSE).
+#  - Section 9.5/9.6, the turn recorder's end-of-turn remux reads back
+#    host.ogg/hostmic.ogg/player.ogg. Without the demuxer the remux fails the
+#    section 3.4 way: the .ogg files are left on disk and the .mp4 is missing.
+--enable-demuxer=rawvideo,pcm_s16le,h264,ogg
 --enable-muxer=h264,mp4,rtp,null,pcm_s16le
 --enable-parser=h264
 # opus: the ogg demuxer above hands ffmpeg a bare Opus stream inside the Ogg
@@ -141,7 +139,14 @@ drokk_ffmpeg_flags() {
 # and 7 Days (AUDIO_PLAN.md section 3.2). It has to happen as PCM inside ONE
 # ffmpeg: section 0.3 shows two ffmpegs writing one SSRC produce an unplayable
 # stream, not a degraded one.
---enable-filter=null,anull,scale,format,aformat,aresample,vflip,color,amix
+#
+# pan,amerge,apad: AUDIO_PLAN.md section 9.5's remux builds the recording's
+# second track, "Voices (L host, R player)": each voice downmixed to mono with
+# pan, the two merged side by side with amerge (then pan again to name the
+# layout stereo), and every track padded with apad to the video's exact
+# duration. apad + `-t` is there because `-shortest` is not usable: on 8.1.2 it
+# drops filtered audio streams from the output entirely (measured).
+--enable-filter=null,anull,scale,format,aformat,aresample,vflip,color,amix,pan,amerge,apad
 --enable-swscale
 --enable-swresample
 
