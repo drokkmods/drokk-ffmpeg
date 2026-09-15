@@ -93,12 +93,16 @@ drokk_ffmpeg_flags() {
 # (-f lavfi -i color=...) dies with "no decoder found for: wrapped_avframe"
 # without it. Another one only a real run finds.
 #
+# pcm_u8 is the decoder for STREAM_PLAN.md section 6.2's synthetic silence
+# input. The lavfi anullsrc filter emits pcm_u8 packets by default, which the
+# CLI must decode before feeding them to the AAC encoder.
+#
 # libopus is the DECODER, a separate component from the libopus encoder above
 # (configure has libopus_decoder_deps and libopus_encoder_deps as two entries).
 # Enabling the encoder does not get you the decoder, and a build with only the
 # encoder fails AUDIO_PLAN.md section 4.2 the silent way: ffmpeg exits with
 # "Decoder (codec opus) not found" and the host simply never hears the player.
---enable-decoder=rawvideo,pcm_s16le,wrapped_avframe,libopus
+--enable-decoder=rawvideo,pcm_s16le,pcm_u8,wrapped_avframe,libopus
 # NOTE the demuxer is pcm_s16le, NOT s16le. `ffmpeg -demuxers` DISPLAYS it as
 # "s16le" but configure's component is PCM_S16LE_DEMUXER, and configure accepts
 # --enable-demuxer=s16le without a word of complaint and builds without it.

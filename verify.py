@@ -152,7 +152,7 @@ def classify_nvenc_failure(err):
 STATIC = [
     ("-encoders",  [r"\blibx264\b", r"\bh264_nvenc\b", r"\blibopus\b", r"\bpcm_s16le\b",
                     r"\baac\b"]),
-    ("-decoders",  [r"\brawvideo\b", r"\bpcm_s16le\b", r"\blibopus\b"]),
+    ("-decoders",  [r"\brawvideo\b", r"\bpcm_s16le\b", r"\bpcm_u8\b", r"\blibopus\b"]),
     ("-demuxers",  [r"\brawvideo\b", r"\bs16le\b", r"\bh264\b", r"\bogg\b"]),
     ("-muxers",    [r"\bh264\b", r"\bmp4\b", r"\brtp\b", r"\bnull\b", r"\bs16le\b",
                     r"\badts\b"]),
