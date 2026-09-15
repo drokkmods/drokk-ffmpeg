@@ -68,6 +68,13 @@ So:
   the case where the game's device rate is not 48 kHz.
 - **`fd` and `pipe` protocols** — every `-i -` and every `... -`.
 
+Not one of the seven mod call sites above, but verified the same way (S8 of
+the app repo's `STREAM_PLAN.md`): the **`aac` encoder**, **`adts` muxer** and
+**`anullsrc` filter** back the YouTube publisher's audio leg — Ogg/Opus on
+stdin re-encoded to AAC/ADTS for the Go RTMPS publisher, or synthetic silence
+via `anullsrc` when there is no audio source. Not yet used by any shipped mod
+build; included because the publisher work depends on this build having it.
+
 Everything else is off. `--disable-everything --disable-autodetect` is the
 starting point; nothing is linked merely because it happened to be installed on
 the build machine.

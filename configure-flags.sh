@@ -6,10 +6,11 @@
 # METHOD: start from --disable-everything and add back ONLY what the mods'
 # actual ffmpeg command lines prove they need. Every flag below is traceable to
 # a specific invocation; the seven of them are enumerated in README.md, the
-# four audio-path additions are AUDIO_PLAN.md section 6, and the turn-recording
-# remux additions (ogg demuxer, opus parser) are AUDIO_PLAN.md section 9.6. Do
-# not add a flag without a call site, and do not remove one without checking
-# all of the above.
+# four audio-path additions are AUDIO_PLAN.md section 6, the turn-recording
+# remux additions (ogg demuxer, opus parser) are AUDIO_PLAN.md section 9.6, and
+# the aac encoder / adts muxer / anullsrc filter are the app repo's
+# STREAM_PLAN.md section 6.2 publisher leg (S8). Do not add a flag without a
+# call site, and do not remove one without checking all of the above.
 #
 # The single most important thing to know about this list: a WRONG list mostly
 # fails SILENTLY. Both Lethal Company and 7 Days treat a dead audio ffmpeg as a
@@ -79,7 +80,14 @@ drokk_ffmpeg_flags() {
 # leg needs BOTH the pcm_s16le muxer (below) and the pcm_s16le encoder, because
 # the s16le muxer's default codec is pcm_s16le and there is nothing else it can
 # fall back to. Neither was needed while ffmpeg only ever READ s16le.
---enable-encoder=libx264,h264_nvenc,libopus,pcm_s16le
+#
+# aac: STREAM_PLAN.md section 6.2, the publisher's audio leg. YouTube ingest
+# is H.264+AAC, not H.264+Opus, so the Ogg/Opus the sidecar already produces
+# (the D4 input, above) is re-encoded once more, this time to AAC, before it
+# reaches ffmpeg's ADTS output (see the adts muxer, below). This is ffmpeg's
+# native `aac` encoder, not libfdk_aac -- no new external library, no licence
+# change.
+--enable-encoder=libx264,h264_nvenc,libopus,pcm_s16le,aac
 # wrapped_avframe is NOT optional: the lavfi indev hands frames to the ffmpeg
 # CLI as wrapped_avframe packets, so Lethal Company's nvenc probe
 # (-f lavfi -i color=...) dies with "no decoder found for: wrapped_avframe"
@@ -109,7 +117,11 @@ drokk_ffmpeg_flags() {
 #    host.ogg/hostmic.ogg/player.ogg. Without the demuxer the remux fails the
 #    section 3.4 way: the .ogg files are left on disk and the .mp4 is missing.
 --enable-demuxer=rawvideo,pcm_s16le,h264,ogg
---enable-muxer=h264,mp4,rtp,null,pcm_s16le
+# adts: STREAM_PLAN.md section 6.2. The publisher's ffmpeg writes its AAC
+# output as ADTS on stdout/pipe:1 (`-f adts pipe:1`), which the Go RTMPS
+# publisher (S7) then repackages into FLV/RTMP AAC frames itself -- ffmpeg
+# never sees the stream key or writes RTMP.
+--enable-muxer=h264,mp4,rtp,null,pcm_s16le,adts
 --enable-parser=h264
 # opus: the ogg demuxer above hands ffmpeg a bare Opus stream inside the Ogg
 # container, and the OPUS PARSER (not the libopus decoder, already enabled
@@ -146,7 +158,12 @@ drokk_ffmpeg_flags() {
 # layout stereo), and every track padded with apad to the video's exact
 # duration. apad + `-t` is there because `-shortest` is not usable: on 8.1.2 it
 # drops filtered audio streams from the output entirely (measured).
---enable-filter=null,anull,scale,format,aformat,aresample,vflip,color,amix,pan,amerge,apad
+# anullsrc: STREAM_PLAN.md section 6.2. With no audio source at all, the
+# publisher feeds ffmpeg a keyless `-f lavfi -i anullsrc=...` input to produce
+# AAC silence on the publisher's timeline, rather than writing a second Go
+# Opus encoder. Distinct from `anull` (above), which passes an EXISTING audio
+# stream through unchanged; anullsrc SYNTHESISES one from nothing.
+--enable-filter=null,anull,anullsrc,scale,format,aformat,aresample,vflip,color,amix,pan,amerge,apad
 --enable-swscale
 --enable-swresample
 

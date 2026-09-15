@@ -150,16 +150,18 @@ def classify_nvenc_failure(err):
 # pcm_s16le for all four. Getting it wrong in this table makes the check pass
 # against a binary that is missing the component.
 STATIC = [
-    ("-encoders",  [r"\blibx264\b", r"\bh264_nvenc\b", r"\blibopus\b", r"\bpcm_s16le\b"]),
+    ("-encoders",  [r"\blibx264\b", r"\bh264_nvenc\b", r"\blibopus\b", r"\bpcm_s16le\b",
+                    r"\baac\b"]),
     ("-decoders",  [r"\brawvideo\b", r"\bpcm_s16le\b", r"\blibopus\b"]),
     ("-demuxers",  [r"\brawvideo\b", r"\bs16le\b", r"\bh264\b", r"\bogg\b"]),
-    ("-muxers",    [r"\bh264\b", r"\bmp4\b", r"\brtp\b", r"\bnull\b", r"\bs16le\b"]),
+    ("-muxers",    [r"\bh264\b", r"\bmp4\b", r"\brtp\b", r"\bnull\b", r"\bs16le\b",
+                    r"\badts\b"]),
     ("-devices",   [r"\blavfi\b"]),
     ("-bsfs",      [r"\bh264_metadata\b"]),
     ("-protocols", [r"\bpipe\b", r"\bfile\b", r"\btcp\b", r"\budp\b", r"\brtp\b"]),
     ("-filters",   [r"\bscale\b", r"\bformat\b", r"\baformat\b", r"\baresample\b",
                     r"\bvflip\b", r"\bcolor\b", r"\bnull\b", r"\banull\b", r"\bamix\b",
-                    r"\bpan\b", r"\bamerge\b", r"\bapad\b"]),
+                    r"\bpan\b", r"\bamerge\b", r"\bapad\b", r"\banullsrc\b"]),
 ]
 
 # The capture/playback devices are the ONE place the two builds legitimately
@@ -950,6 +952,92 @@ def case_D4_ogg_stdin_decode(ff, outdir):
     record("PASS", name,
            f"{len(out)} bytes s16le, peak {peak}, from Ogg Opus on stdin -> {pcm_path}")
 
+# --- STREAM_PLAN.md section 6.2 / S8: the publisher's audio leg --------------
+#
+# Ogg/Opus in (the same container D4 already proves the demuxer handles) ->
+# ffmpeg's own aac encoder -> ADTS on stdout, which is what the Go RTMPS
+# publisher (S7, not built by this repo) reads and repackages into FLV/RTMP
+# AAC frames. Two ffmpeg-only components that nothing else here exercises:
+# the aac encoder and the adts muxer. A silence leg (anullsrc, no Ogg/Opus
+# input at all) is verified separately because the publisher uses it whenever
+# there is no audio source instead of writing a second Go Opus encoder.
+
+def _adts_frames(buf):
+    """Walk ADTS syncwords (0xFFF...) and yield (frame_length, sample_rate_idx,
+    channel_config). Minimal -- only what's needed to sanity-check the muxer's
+    output, not a general ADTS parser."""
+    ADTS_SAMPLE_RATES = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
+                         16000, 12000, 11025, 8000, 7350]
+    i, n = 0, len(buf)
+    while i + 7 <= n:
+        if buf[i] != 0xFF or (buf[i + 1] & 0xF0) != 0xF0:
+            i += 1
+            continue
+        sr_idx = (buf[i + 2] >> 2) & 0x0F
+        chan_cfg = ((buf[i + 2] & 0x01) << 2) | (buf[i + 3] >> 6)
+        frame_len = ((buf[i + 3] & 0x03) << 11) | (buf[i + 4] << 3) | (buf[i + 5] >> 5)
+        if frame_len < 7 or i + frame_len > n:
+            i += 1
+            continue
+        sr = ADTS_SAMPLE_RATES[sr_idx] if sr_idx < len(ADTS_SAMPLE_RATES) else 0
+        yield frame_len, sr, chan_cfg
+        i += frame_len
+
+def case_S8_publisher_audio_leg(ff, name, outdir):
+    """STREAM_PLAN.md section 6.2, verbatim:
+        -f ogg -i pipe:0 -af aresample=async=1:first_pts=0 -c:a aac -b:a 128k
+        -ar 48000 -ac 2 -f adts pipe:1
+    """
+    try:
+        ogg = synth_ogg_opus(ff, 2, serial=0x53545231, freq_hz=440)
+    except RuntimeError as e:
+        return record("FAIL", name, "could not synthesise an Ogg Opus fixture: " + str(e))
+
+    args = ["-hide_banner", "-loglevel", "warning",
+            "-f", "ogg", "-i", "pipe:0",
+            "-af", "aresample=async=1:first_pts=0",
+            "-c:a", "aac", "-b:a", "128k", "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
+            "-f", "adts", "pipe:1"]
+    rc, out, err = run(ff, args, stdin=ogg, timeout=60)
+    if rc != 0 or not out:
+        return record("FAIL", name, "aac encoder, aresample filter or adts muxer: "
+                      + (err.strip().splitlines() or ["rc=%d, no output" % rc])[-1][:160])
+    frames = list(_adts_frames(out))
+    if not frames:
+        return record("FAIL", name, f"{len(out)} bytes but no valid ADTS syncword found")
+    bad_sr = [f for f in frames if f[1] != SAMPLE_RATE]
+    bad_ch = [f for f in frames if f[2] != CHANNELS]
+    if bad_sr or bad_ch:
+        return record("FAIL", name,
+                      f"ADTS header mismatch: sample_rate/channels wrong on "
+                      f"{len(bad_sr)}/{len(bad_ch)} of {len(frames)} frames")
+    adts_path = os.path.join(outdir, "publisher-audio.adts")
+    open(adts_path, "wb").write(out)
+    record("PASS", name,
+           f"{len(out)} bytes ADTS, {len(frames)} AAC frames @ {SAMPLE_RATE}/{CHANNELS}ch, "
+           f"from Ogg Opus on stdin -> {adts_path}")
+
+def case_S8_anullsrc_silence(ff, name, outdir):
+    """STREAM_PLAN.md section 6.2: with no audio source at all, the publisher
+    feeds ffmpeg a keyless `-f lavfi -i anullsrc=...` input to produce AAC
+    silence on the publisher's timeline, rather than a new Go Opus encoder."""
+    args = ["-hide_banner", "-loglevel", "warning",
+            "-f", "lavfi", "-i", f"anullsrc=r={SAMPLE_RATE}:cl=stereo",
+            "-t", "1",
+            "-c:a", "aac", "-b:a", "128k", "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
+            "-f", "adts", "pipe:1"]
+    rc, out, err = run(ff, args, timeout=30)
+    if rc != 0 or not out:
+        return record("FAIL", name, "anullsrc filter, aac encoder or adts muxer: "
+                      + (err.strip().splitlines() or ["rc=%d, no output" % rc])[-1][:160])
+    frames = list(_adts_frames(out))
+    if not frames:
+        return record("FAIL", name, f"{len(out)} bytes but no valid ADTS syncword found")
+    adts_path = os.path.join(outdir, "publisher-silence.adts")
+    open(adts_path, "wb").write(out)
+    record("PASS", name,
+           f"{len(out)} bytes ADTS, {len(frames)} AAC frames of anullsrc silence -> {adts_path}")
+
 # --- main --------------------------------------------------------------------
 
 def main():
@@ -1009,6 +1097,10 @@ def main():
     case_D2_pulse_alsa(ff, win)
     case_D3_amix(ff, a.outdir)
     case_D4_ogg_stdin_decode(ff, a.outdir)
+
+    print("\n== STREAM_PLAN.md section 6.2 / S8: the publisher's audio leg ==")
+    case_S8_publisher_audio_leg(ff, "S8 Ogg Opus on stdin -> aac -> adts", a.outdir)
+    case_S8_anullsrc_silence(ff, "S8 anullsrc -> aac -> adts (silence leg)", a.outdir)
 
     print("\n== AUDIO_PLAN.md section 9.6: the turn-recording remux ==")
     case_R1_recording_remux(ff, v1, a.outdir)
