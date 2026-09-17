@@ -8,12 +8,16 @@
 # RECIPE_HASH from this repo and refuses to ship a dist/ whose BUILD-INFO
 # disagrees, or that has no BUILD-INFO at all.
 #
-# FORMAT (SCHEMA=1): KEY=VALUE lines, '#' comments -- the same shape as PINNED,
+# FORMAT (SCHEMA=2): KEY=VALUE lines, '#' comments -- the same shape as PINNED,
 # so a reader can take it with  grep -E '^[A-Z0-9_]+=' BUILD-INFO.
-#   SCHEMA               1
+#   SCHEMA               2
 #   FLAVOUR              linux-x86_64 | win64
 #   RECIPE_HASH          sha256 hex, see drokk_ffmpeg_recipe_hash below
 #   RECIPE_DIRTY         0 | 1  (recipe files had uncommitted changes at build time)
+#   RECIPE_FILE          one per recipe input: "<content id> <path>", in recipe
+#                        order. The verifier compares these file by file so a
+#                        mismatch can name the file that changed, instead of
+#                        printing two hashes that mean nothing to a human.
 #   FFMPEG_TAG           from PINNED
 #   FFMPEG_COMMIT        from PINNED
 #   DROKK_FFMPEG_COMMIT  git HEAD of this repo
@@ -28,16 +32,33 @@
 # change both together or every check will refuse.
 DROKK_FFMPEG_RECIPE=(PINNED configure-flags.sh build-linux.sh build-win64.sh remote-build.sh)
 
-# RELEASE_PLAN.md section 2.2's component_hash, verbatim: committed tree/blob
-# hashes, plus sha256 of each dirty file, so an uncommitted recipe hashes to what
-# its contents are rather than to HEAD.
+# drokk_ffmpeg_recipe_ids <repo> -> "<content id> <path>" per recipe input.
+#
+# The id is `git hash-object` of the file AS IT SITS ON DISK, which is what the
+# build actually reads. For a clean tracked file that is identical to its blob
+# id in HEAD, so committed and uncommitted state are the same number: editing a
+# recipe file changes the id, and committing that same edit does not.
+#
+# SCHEMA=1 hashed committed files by blob id but dirty ones by `sha256sum
+# $repo/$f`. The same bytes therefore hashed differently before and after a
+# commit -- so committing a recipe file you had already built from made dist/
+# "stale" and demanded a rebuild that would produce identical binaries. It also
+# folded the absolute repo path into the hash, so moving the checkout did the
+# same thing. Both are gone: only file contents and recipe-relative paths count.
+drokk_ffmpeg_recipe_ids() {
+  local repo="$1" p
+  for p in "${DROKK_FFMPEG_RECIPE[@]}"; do
+    if [ -f "$repo/$p" ]; then
+      printf '%s %s\n' "$(git -C "$repo" hash-object -- "$repo/$p")" "$p"
+    else
+      printf 'absent %s\n' "$p"
+    fi
+  done
+}
+
+# drokk_ffmpeg_recipe_hash <repo> -> one sha256 over the id list above.
 drokk_ffmpeg_recipe_hash() {
-  local repo="$1"
-  {
-    for p in "${DROKK_FFMPEG_RECIPE[@]}"; do git -C "$repo" rev-parse "HEAD:$p" 2>/dev/null || echo "absent:$p"; done
-    git -C "$repo" status --porcelain -- "${DROKK_FFMPEG_RECIPE[@]}" \
-      | while read -r _st f; do [ -f "$repo/$f" ] && sha256sum "$repo/$f"; done
-  } | sha256sum | cut -d' ' -f1
+  drokk_ffmpeg_recipe_ids "$1" | sha256sum | cut -d' ' -f1
 }
 
 # drokk_ffmpeg_require_built_from <hash-recorded-at-compile> <current-recipe-hash>
@@ -68,10 +89,11 @@ drokk_ffmpeg_write_build_info() {
   [ -n "$(git -C "$repo" status --porcelain -- "${DROKK_FFMPEG_RECIPE[@]}")" ] && dirty=1
   cat > "$dist/BUILD-INFO.tmp" <<EOF || return 1
 # drokk-ffmpeg BUILD-INFO -- written by the build, never by hand. See build-info.sh.
-SCHEMA=1
+SCHEMA=2
 FLAVOUR=$flavour
 RECIPE_HASH=$(drokk_ffmpeg_recipe_hash "$repo")
 RECIPE_DIRTY=$dirty
+$(drokk_ffmpeg_recipe_ids "$repo" | sed 's/^/RECIPE_FILE=/')
 FFMPEG_TAG=$FFMPEG_TAG
 FFMPEG_COMMIT=$FFMPEG_COMMIT
 DROKK_FFMPEG_COMMIT=$(git -C "$repo" rev-parse HEAD)
